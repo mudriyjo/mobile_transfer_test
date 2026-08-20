@@ -1,0 +1,89 @@
+stages:
+  - validate
+  - test
+  - platform
+
+default:
+  interruptible: true
+  before_script:
+    - chmod +x gradlew scripts/*.sh
+  cache:
+    key: "gradle-${CI_PROJECT_ID}"
+    paths:
+      - .gradle/caches/
+      - .gradle/wrapper/
+
+variables:
+  GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle"
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+script_syntax:
+  stage: validate
+  image: bash:5.2
+  before_script: []
+  script:
+    - bash -n scripts/doctor.sh scripts/change-budget.sh scripts/submission-contract.sh
+
+candidate_preflight:
+  stage: test
+  image: eclipse-temurin:21-jdk
+  script:
+    - ./gradlew --no-daemon --stacktrace candidatePreflight
+  artifacts:
+    when: always
+    expire_in: 7 days
+    reports:
+      junit:
+        - "**/build/test-results/**/TEST-*.xml"
+
+backend_stub:
+  stage: test
+  image: eclipse-temurin:21-jdk
+  script:
+    - ./gradlew --no-daemon --stacktrace :backendStub:test
+  artifacts:
+    when: always
+    expire_in: 7 days
+    reports:
+      junit:
+        - "backendStub/build/test-results/**/TEST-*.xml"
+
+android_verification:
+  stage: platform
+  image: ghcr.io/cirruslabs/android-sdk:36
+  script:
+    - ./gradlew --no-daemon --stacktrace verifyAndroid
+  artifacts:
+    when: always
+    expire_in: 7 days
+    reports:
+      junit:
+        - "**/build/test-results/**/TEST-*.xml"
+
+ios_verification:
+  stage: platform
+  tags:
+    - macos
+    - xcode
+  script:
+    - ./gradlew --no-daemon --stacktrace verifyIosSimulator
+  artifacts:
+    when: always
+    expire_in: 7 days
+    reports:
+      junit:
+        - "**/build/test-results/**/TEST-*.xml"
+
+submission_contract:
+  stage: validate
+  image: bash:5.2
+  before_script:
+    - chmod +x scripts/*.sh
+  script:
+    - ASSESSMENT_BASE_REF="${ASSESSMENT_BASE_REF}" ./scripts/submission-contract.sh
+  rules:
+    - if: '$ASSESSMENT_SUBMISSION == "true" && $ASSESSMENT_BASE_REF'

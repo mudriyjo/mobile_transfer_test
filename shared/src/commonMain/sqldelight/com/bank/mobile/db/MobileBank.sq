@@ -1,0 +1,158 @@
+CREATE TABLE account_cache (
+    account_id TEXT NOT NULL PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    masked_number TEXT NOT NULL,
+    balance_minor INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    updated_at_epoch_ms INTEGER NOT NULL
+);
+
+CREATE TABLE beneficiary (
+    beneficiary_id TEXT NOT NULL PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    masked_account TEXT NOT NULL,
+    currency TEXT NOT NULL
+);
+
+CREATE TABLE transfer_operation (
+    operation_id TEXT NOT NULL PRIMARY KEY,
+    remote_transfer_id TEXT,
+    flow_kind TEXT NOT NULL,
+    from_account_id TEXT NOT NULL,
+    beneficiary_id TEXT NOT NULL,
+    amount_minor INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    reference TEXT,
+    payload_fingerprint TEXT NOT NULL,
+    local_status TEXT NOT NULL,
+    server_status TEXT,
+    created_at_epoch_ms INTEGER NOT NULL,
+    updated_at_epoch_ms INTEGER NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE UNIQUE INDEX transfer_remote_id_uq
+ON transfer_operation(remote_transfer_id)
+WHERE remote_transfer_id IS NOT NULL;
+
+CREATE TABLE scheduled_payment (
+    schedule_id TEXT NOT NULL PRIMARY KEY,
+    beneficiary_id TEXT NOT NULL,
+    from_account_id TEXT NOT NULL,
+    amount_minor INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    execute_at_epoch_ms INTEGER NOT NULL,
+    operation_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    remote_transfer_id TEXT,
+    last_error_code TEXT,
+    last_attempt_epoch_ms INTEGER
+);
+
+selectAccounts:
+SELECT * FROM account_cache ORDER BY display_name;
+
+replaceAccount:
+INSERT OR REPLACE INTO account_cache VALUES (?, ?, ?, ?, ?, ?);
+
+deleteAccounts:
+DELETE FROM account_cache;
+
+selectBeneficiaries:
+SELECT * FROM beneficiary ORDER BY display_name;
+
+replaceBeneficiary:
+INSERT OR REPLACE INTO beneficiary VALUES (?, ?, ?, ?);
+
+deleteBeneficiaries:
+DELETE FROM beneficiary;
+
+selectTransfer:
+SELECT * FROM transfer_operation WHERE operation_id = ?;
+
+selectTransferByRemoteId:
+SELECT * FROM transfer_operation WHERE remote_transfer_id = ?;
+
+selectAllTransfers:
+SELECT * FROM transfer_operation ORDER BY created_at_epoch_ms DESC;
+
+selectRecentTransfers:
+SELECT * FROM transfer_operation
+ORDER BY created_at_epoch_ms DESC, updated_at_epoch_ms DESC
+LIMIT ?;
+
+selectTransfersByFlowKind:
+SELECT * FROM transfer_operation
+WHERE flow_kind = ?
+ORDER BY created_at_epoch_ms DESC, updated_at_epoch_ms DESC;
+
+selectTransfersByLocalStatus:
+SELECT * FROM transfer_operation
+WHERE local_status = ?
+ORDER BY created_at_epoch_ms DESC, updated_at_epoch_ms DESC;
+
+countTransfersByLocalStatus:
+SELECT COUNT(*) FROM transfer_operation WHERE local_status = ?;
+
+selectUnfinishedTransfers:
+SELECT * FROM transfer_operation
+WHERE local_status IN ('SUBMITTING', 'OUTCOME_UNKNOWN', 'PROCESSING')
+ORDER BY created_at_epoch_ms;
+
+insertTransferIntent:
+INSERT INTO transfer_operation(
+    operation_id, remote_transfer_id, flow_kind, from_account_id, beneficiary_id,
+    amount_minor, currency, reference, payload_fingerprint, local_status,
+    server_status, created_at_epoch_ms, updated_at_epoch_ms, attempt_count
+) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 'SUBMITTING', NULL, ?, ?, 0);
+
+saveTransferResponse:
+INSERT OR REPLACE INTO transfer_operation(
+    operation_id, remote_transfer_id, flow_kind, from_account_id, beneficiary_id,
+    amount_minor, currency, reference, payload_fingerprint, local_status,
+    server_status, created_at_epoch_ms, updated_at_epoch_ms, attempt_count
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+updateTransferStatus:
+UPDATE transfer_operation
+SET remote_transfer_id = COALESCE(:remoteId, remote_transfer_id),
+    local_status = :localStatus,
+    server_status = :serverStatus,
+    updated_at_epoch_ms = :updatedAt
+WHERE operation_id = :operationId;
+
+incrementTransferAttempt:
+UPDATE transfer_operation
+SET attempt_count = attempt_count + 1, updated_at_epoch_ms = ?
+WHERE operation_id = ?;
+
+updateTransferLocalStatus:
+UPDATE transfer_operation
+SET local_status = ?, updated_at_epoch_ms = ?
+WHERE operation_id = ?;
+
+updateTransferServerStatus:
+UPDATE transfer_operation
+SET server_status = ?, updated_at_epoch_ms = ?
+WHERE operation_id = ?;
+
+deleteTransfer:
+DELETE FROM transfer_operation WHERE operation_id = ?;
+
+selectScheduledPayments:
+SELECT * FROM scheduled_payment ORDER BY execute_at_epoch_ms;
+
+insertScheduledPayment:
+INSERT INTO scheduled_payment(
+    schedule_id, beneficiary_id, from_account_id, amount_minor, currency,
+    execute_at_epoch_ms, operation_id, status, remote_transfer_id,
+    last_error_code, last_attempt_epoch_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL);
+
+updateScheduledResult:
+UPDATE scheduled_payment
+SET status = ?,
+    remote_transfer_id = ?,
+    last_error_code = ?,
+    last_attempt_epoch_ms = ?
+WHERE schedule_id = ?;
