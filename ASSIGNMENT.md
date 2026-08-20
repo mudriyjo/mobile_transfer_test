@@ -84,23 +84,6 @@ Name the tools and purposes, two suggestions you accepted, at least one suggesti
 
 Choose exactly one: `GO`, `CONDITIONAL GO`, or `NO-GO`. State what is safe, what remains mandatory before release, required platform checks, post-release telemetry, rollback or kill-switch behavior, and mobile/backend compatibility.
 
-## Change budget
-
-The expected maximum is:
-
-- 10 changed production files;
-- 5 changed shared production files unless separately justified;
-- 400 added/removed production lines;
-- 300 added/removed test lines;
-- one local database migration;
-- one new dependency;
-- 700 words in `DECISIONS.md`;
-- 300 words in `AI_USAGE.md`.
-
-Exceeding a limit is not an automatic failure, but it must be justified by the selected invariant. Extra features do not increase the score and increase the amount of code you must defend live.
-
-Run `./scripts/change-budget.sh [base-ref]` to inspect the mechanical budget. The script is an aid, not a semantic scope review.
-
 ## Product and technical context
 
 The application supports account balances, beneficiaries, instant transfers, scheduled payments, and operation status. Accounts are the reference implementation for cache and state restoration. Scheduled payments share transfer infrastructure, so a shared client or operation-identifier change must be checked against that path.
