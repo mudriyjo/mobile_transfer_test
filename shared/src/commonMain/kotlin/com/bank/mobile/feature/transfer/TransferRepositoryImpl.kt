@@ -1,6 +1,9 @@
 package com.bank.mobile.feature.transfer
 
 import com.bank.mobile.core.ids.OperationId
+import com.bank.mobile.core.network.AuthenticationException
+import com.bank.mobile.core.network.DefinitiveRejectionException
+import com.bank.mobile.core.network.IdempotencyConflictException
 import com.bank.mobile.core.network.NetworkMonitor
 import com.bank.mobile.core.network.NoInternetException
 import com.bank.mobile.core.time.DeviceEpochClock
