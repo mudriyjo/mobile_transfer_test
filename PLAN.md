@@ -6,8 +6,8 @@ User confirms a transfer → biometric authentication → operation ID generated
 
 1. `TransferViewModel.confirm()` validates draft (TransferViewModel.kt:95)
 2. Biometric authentication requested (TransferViewModel.kt:109)
-3. **Operation ID generated fresh on each confirm** (TransferViewModel.kt:117: `val operationId = operationIds.next()`)
-4. Analytics tracked with transfer details (TransferViewModel.kt:119)
+3. **Operation ID generated fresh on each confirm** (TransferViewModel.kt:115: `val operationId = operationIds.next()`)
+4. Analytics tracked with transfer details (TransferViewModel.kt:117)
 5. `CreateTransferUseCase` invoked (TransferViewModel.kt:128)
 6. `TransferRepositoryImpl.createTransfer()` validates and checks network (TransferRepositoryImpl.kt:18-26)
 7. `TransferRemoteDataSource.create()` calls API with operation ID as idempotency key (TransferRemoteDataSource.kt:9)
@@ -33,7 +33,7 @@ User confirms a transfer → biometric authentication → operation ID generated
    - **Impact:** Customer charged twice, bank liability, regulatory breach, customer trust loss
    - **Conditions:** Network instability (mobile common), backend accepts first request but client times out, user sees generic failure and retries
    - **Evidence:**
-     - TransferViewModel.kt:117 generates fresh ID on every confirm, not persisted before API call
+     - TransferViewModel.kt:115 generates fresh ID on every confirm, not persisted before API call
      - TransferRepositoryImpl.kt:38 deletes operation on any exception including timeout
      - docs/transfer-api.md:95 "Cancellation, timeout... can happen after server commit"
      - TransferViewModel.kt:95 retry action uses same draft but will generate new ID
@@ -55,7 +55,7 @@ User confirms a transfer → biometric authentication → operation ID generated
    - **Impact:** Duplicate transfer execution, lost reconciliation opportunity, customer charged twice
    - **Conditions:** Android/iOS background kill, low memory, force quit, OS resource pressure
    - **Evidence:**
-     - TransferViewModel.kt:117 generates fresh operation ID on every confirm, not persisted before call
+     - TransferViewModel.kt:115 generates fresh operation ID on every confirm, not persisted before call
      - No saveIntent() before remote.create() in TransferRepositoryImpl.kt:27
      - TransferViewModel.kt:68 reconcileAfterForeground() depends on local records existing
      - TransferLocalDataSource.kt:82 unfinished() cannot find operations deleted at line 38
