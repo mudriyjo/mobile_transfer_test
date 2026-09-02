@@ -20,7 +20,7 @@
 - Inspected TransferLocalDataSource.kt to verify saveIntent() implementation exists
 - Reviewed docs/current-architecture.md:82 confirming SQLDelight is the durable source of truth
 - Manually traced execution path: ViewModel generates ID → repository persists → remote call → response handling
-- Confirmed SQLDelight transaction semantics ensure atomicity of intent persistence
+- Reviewed the SQLDelight persistence implementation and transaction usage; physical durability was not experimentally verified
 
 **2. Reuse pending operation ID for retry instead of generating new ID**
 
@@ -42,7 +42,7 @@
 - Reviewed docs/transfer-api.md error response contract with `outcome` field
 - Inspected TransferRepositoryImpl original implementation deleting on any exception
 - Confirmed reconciliation logic depends on local records existing
-- Verified that preserving ambiguous outcomes as `OUTCOME_UNKNOWN` enables status query by operation ID
+- Reviewed reconciliation flow showing that the local operation record is required for status lookup by operation ID
 - Implementation deletes for specific categories (`NoInternetException`, `DefinitiveRejectionException`, `IdempotencyConflictException`, `AuthenticationException`) while preserving others
 
 # Rejected or Changed Suggestion
@@ -90,8 +90,9 @@
 
 **Build verification:**
 - Ran `./gradlew :shared:jvmTest --tests TransferRepositoryImplTest` → PASSED
-- Confirmed Kotlin compilation successful with no new warnings
-- Verified test assertions cover operation ID persistence, reuse, and ambiguous outcome preservation
+- Focused JVM test compilation succeeded
+- Existing Gradle deprecation warnings remain
+- Verified focused test assertions cover intent persistence before the remote call and ambiguous outcome preservation
 
 **Git history analysis:**
 - Reviewed commit history to identify broader refactor attempts
@@ -100,13 +101,16 @@
 
 **Platform-specific assumption verification:**
 
-**Assumption:** SQLDelight transaction isolation and durability should be equivalent on Android (AndroidSqliteDriver) and iOS (NativeSqliteDriver), and database writes should survive process termination.
+**Assumption reviewed:** Shared transfer persistence uses SQLDelight with platform-specific Android and iOS drivers.
 
 **Verification approach:**
-- Reviewed SQLDelight documentation for transaction semantics
-- Inspected shared/src/androidMain and shared/src/iosMain for driver implementations at repository source level
+- Inspected shared Android and iOS database driver implementations at repository source level
 - Reviewed docs/current-architecture.md stating SQLDelight is the shared source of truth
-- Confirmed both platforms use SQLDelight with platform-specific drivers
+- Confirmed no platform-specific production change was required for the selected invariant
+
+**Verification boundary:**
+- This was a code/documentation review, not a device or simulator experiment
+- Physical database durability across process termination remains unverified
 
 **Unverified platform behavior:**
 - SQLDelight transaction durability guarantees (WAL mode, synchronous writes, flush timing) not experimentally verified
