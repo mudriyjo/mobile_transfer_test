@@ -25,6 +25,13 @@ class TransferRepositoryImpl(
         }
         if (!networkMonitor.isOnline.value) throw NoInternetException()
 
+        local.saveIntent(
+            operationId = operationId,
+            draft = normalizedDraft,
+            flowKind = TransferFlowKind.INSTANT,
+            nowMillis = clock.nowMillis(),
+        )
+
         return try {
             val response = remote.create(operationId, normalizedDraft)
             local.saveResponse(
@@ -36,8 +43,18 @@ class TransferRepositoryImpl(
             )
             checkNotNull(local.find(operationId))
         } catch (error: Exception) {
-            // Remove the transient record before surfacing the request failure.
-            local.delete(operationId)
+            when (error) {
+                is NoInternetException,
+                is DefinitiveRejectionException,
+                is IdempotencyConflictException,
+                is AuthenticationException,
+                -> {
+                    local.delete(operationId)
+                }
+                else -> {
+                    local.markUnknown(operationId, clock.nowMillis())
+                }
+            }
             throw error
         }
     }

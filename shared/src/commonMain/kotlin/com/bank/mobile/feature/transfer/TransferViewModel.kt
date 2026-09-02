@@ -37,6 +37,8 @@ class TransferViewModel(
     private val mutableEvents = MutableSharedFlow<TransferEvent>(replay = 1)
     val events: SharedFlow<TransferEvent> = mutableEvents.asSharedFlow()
 
+    private var pendingOperationId: OperationId? = null
+
     fun dispatch(action: TransferAction) {
         when (action) {
             is TransferAction.Confirm -> confirm(action.draft)
@@ -47,7 +49,10 @@ class TransferViewModel(
             TransferAction.RefreshCurrentStatus -> refreshCurrentStatus()
             TransferAction.LoadHistory -> loadHistory()
             is TransferAction.ChangeHistoryFilter -> changeHistoryFilter(action.filter)
-            TransferAction.StartAnotherTransfer -> mutate(TransferMutation.Reset)
+            TransferAction.StartAnotherTransfer -> {
+                pendingOperationId = null
+                mutate(TransferMutation.Reset)
+            }
         }
     }
 
@@ -108,7 +113,11 @@ class TransferViewModel(
             }
 
             mutate(TransferMutation.SubmissionStarted)
-            val operationId = operationIds.next()
+            val operationId = if (pendingOperationId != null && mutableState.value.draft == draft) {
+                pendingOperationId!!
+            } else {
+                operationIds.next().also { pendingOperationId = it }
+            }
             mutate(TransferMutation.OperationSelected(operationId))
             analytics.track(
                 AnalyticsEvent(
@@ -124,12 +133,19 @@ class TransferViewModel(
 
             runCatching { createTransfer(operationId, draft) }
                 .onSuccess { transfer ->
+                    pendingOperationId = null
                     mutate(TransferMutation.SubmissionSucceeded(transfer))
                     mutableEvents.emit(TransferEvent.OpenResult(transfer.operationId.value))
                     loadHistorySnapshot(mutableState.value.history.filter)
                 }
                 .onFailure { error ->
                     val failure = error.toTransferFailure()
+                    if (failure.kind == TransferFailureKind.BANK_REJECTION ||
+                        failure.kind == TransferFailureKind.VALIDATION ||
+                        failure.kind == TransferFailureKind.OPERATION_CONFLICT
+                    ) {
+                        pendingOperationId = null
+                    }
                     mutate(
                         TransferMutation.SubmissionFailed(
                             message = failure.userMessage,
