@@ -39,49 +39,51 @@ User confirms a transfer → biometric authentication → operation ID generated
      - TransferViewModel.kt:95 retry action uses same draft but will generate new ID
      - No saveIntent() call before remote.create() in TransferRepositoryImpl.kt:27
 
-2. **Risk: Lost operation status after process death**
-   - **Scenario:** Transfer submitted → response received → app killed before navigation completes → user reopens app → no record of transfer → user uncertain if money moved
-   - **Impact:** Customer anxiety, support calls, potential duplicate if user resubmits, reconciliation required
-   - **Conditions:** Android/iOS background kill during navigation, low memory, force quit
+2. **Risk: Ambiguous outcome presented as definitive failure**
+   - **Scenario:** User confirms transfer → network timeout/connection loss after server commit → app shows "Transfer failed" → user believes money did not move → backend has committed the transfer
+   - **Impact:** Customer confusion, incorrect mental model of account balance, potential duplicate if user resubmits, reconciliation gap
+   - **Conditions:** Network instability, app termination during response, malformed response after commit
    - **Evidence:**
-     - TransferViewModel.kt:130 emits navigation event after persistence but before guaranteed delivery
-     - No evidence of ViewModel surviving process death (not SavedStateHandle-backed)
-     - TransferViewModel.kt:68 reconcileAfterForeground() only reconciles unfinished transfers
-     - TransferLocalDataSource.kt:82 unfinished() queries non-terminal status, but COMPLETED won't reconcile
+     - TransferRepositoryImpl.kt:38 deletes operation on any exception, losing tracking
+     - TransferViewModel.kt:241 maps generic Throwable to "Transfer failed" with canTryAgain=true
+     - docs/transfer-api.md:95 "Cancellation, timeout, connection loss... can happen after server commit"
+     - No distinction between UnknownOutcomeException and definitive rejection in local persistence
+     - User sees same failure UI for network error and business rejection
 
-3. **Risk: Idempotency conflict prevents legitimate retry**
-   - **Scenario:** User confirms transfer → 409 Conflict from backend (payload mismatch) → app shows generic failure → user cannot recover without support intervention
-   - **Impact:** Customer blocked from completing intended transfer, poor UX, support escalation
-   - **Conditions:** Rare but possible if payload canonicalization differs between attempts or backend fingerprint logic changes
+3. **Risk: Loss of unfinished transfer state after lifecycle interruption**
+   - **Scenario:** Transfer submitted → status PROCESSING → app backgrounded → process killed → user reopens app → no pending transfer shown → user resubmits with new operation ID
+   - **Impact:** Duplicate transfer execution, lost reconciliation opportunity, customer charged twice
+   - **Conditions:** Android/iOS background kill, low memory, force quit, OS resource pressure
    - **Evidence:**
-     - TransferViewModel.kt:186 maps IdempotencyConflictException to OPERATION_CONFLICT
-     - TransferViewModel.kt:187 sets canTryAgain=false correctly
-     - But no user-facing guidance on what "conflict" means or how to resolve
-     - docs/transfer-api.md:48 "never generate a replacement key automatically" - correct but no recovery path shown
+     - TransferViewModel.kt:117 generates fresh operation ID on every confirm, not persisted before call
+     - No saveIntent() before remote.create() in TransferRepositoryImpl.kt:27
+     - TransferViewModel.kt:68 reconcileAfterForeground() depends on local records existing
+     - TransferLocalDataSource.kt:82 unfinished() cannot find operations deleted at line 38
+     - ViewModel state does not survive process death (no SavedStateHandle)
 
 # Chosen Slice
 
-**Invariant:** The operation ID for a transfer intent must be durably persisted before the first API call, survive process death, and be reused for any protocol-level retry of the same customer intent.
+**Invariant:** The operation ID for a transfer intent must be durably persisted before the first API call, survive process death, and be reused for any retry or recovery of the same customer intent.
 
-**Why highest value:** Directly prevents duplicate execution (Risk #1), the most severe financial and regulatory impact. Establishes the foundation for proper idempotency. Small, focused change in repository layer.
+**Why highest value:** Directly prevents duplicate execution (Risk #1 and #3), the most severe financial and regulatory impact. Establishes the foundation for proper idempotency. Requires coordination between ViewModel (operation ID generation/reuse) and repository (intent persistence).
 
 **Expected files affected:**
-- Production: `TransferRepositoryImpl.kt` (add saveIntent before remote call), `TransferLocalDataSource.kt` (verify saveIntent exists)
-- Tests: New test in `TransferRepositoryImplTest.kt` or similar for intent persistence, failure recovery test
+- Production: `TransferViewModel.kt` (persist and reuse operation ID across retries), `TransferRepositoryImpl.kt` (call saveIntent before remote call), `TransferLocalDataSource.kt` (verify saveIntent exists)
+- Tests: New test for operation ID stability across retry, intent persistence before API call, recovery after ambiguous outcome
 
 # Validation Plan
 
-1. **Main invariant check:** Test that operation ID is persisted to local storage before `remote.create()` is invoked, and that the same ID is reused if the repository method is called again with the same draft after a network failure.
-   - **Asserts:** SQLDelight contains operation record before API call, same operation ID returned on retry
+1. **Main invariant check:** Test that operation ID is persisted to local storage before `remote.create()` is invoked, and that the same operation ID is reused when the user retries after a network failure.
+   - **Asserts:** SQLDelight contains operation record before API call, ViewModel reuses same operation ID on retry action, no duplicate operation IDs created
 
-2. **Ambiguous outcome recovery:** Test that when `remote.create()` throws an exception simulating timeout after commit, the operation record remains in local storage with status OUTCOME_UNKNOWN, and a subsequent retry attempt uses the same operation ID.
-   - **Asserts:** No duplicate operation IDs created, local record survives exception, backend journal shows single create attempt
+2. **Ambiguous outcome recovery:** Test the real path: user confirms transfer (op-1) → network timeout after server commit → app shows ambiguous outcome → user retries → same op-1 is reused → backend returns existing transfer via idempotency.
+   - **Asserts:** Backend journal shows single create attempt, local storage contains op-1 throughout, retry uses op-1 not op-2, final state reflects single transfer
 
-3. **Idempotency conflict detection:** Test that when backend returns 409 Conflict, the local record is marked appropriately and no automatic retry with new ID occurs.
-   - **Asserts:** Exception propagated, no new operation ID generated, user informed
+3. **Process death simulation:** Test that after saveIntent() but before saveResponse(), the operation can be found and reconciled on next app launch, and that reconciliation does not create a duplicate.
+   - **Asserts:** Operation survives ViewModel/repository scope cancellation, reconciliation finds pending operation, no new operation ID generated
 
-4. **Process death simulation:** Test that after saveIntent() but before saveResponse(), the operation can be found and reconciled on next app launch.
-   - **Asserts:** Operation survives repository scope cancellation, reconciliation finds pending operation
+4. **Definitive rejection vs ambiguous outcome:** Test that a 422 rejection is distinguished from a timeout, and that only the timeout preserves the operation for retry.
+   - **Asserts:** Rejection deletes operation, timeout preserves operation, user sees different failure messages
 
 # Platform Impact
 
@@ -118,16 +120,19 @@ User confirms a transfer → biometric authentication → operation ID generated
 
 **CONDITIONAL GO**
 
-**Safe to release:**
+**Safe to release if invariant is implemented and validated:**
 - Operation ID persistence before API call prevents duplicate execution
+- Operation ID reuse across retry prevents duplicate after ambiguous outcome
 - Idempotency contract properly honored
 - Shared code benefits both platforms equally
 
 **Mandatory before release:**
+- Implement and validate the operation ID persistence and reuse invariant
 - Verify SQLDelight transaction durability on both Android and iOS physical devices
 - Confirm scheduled payment occurrence IDs work with new persistence timing
 - Add telemetry for operation ID reuse vs. new generation to monitor effectiveness
 - Test force-quit → relaunch → reconciliation on both platforms
+- Verify that ambiguous outcomes are distinguished from definitive failures in UI
 
 **Post-release monitoring:**
 - Track operation ID collision rate (should be zero with ULID/UUID)
