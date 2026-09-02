@@ -13,7 +13,7 @@
 9. Backend receives different idempotency key → executes SECOND transfer
 10. Customer charged twice
 
-**Root cause:** Operation ID is generated fresh on each confirm attempt and not persisted before the API call. When an ambiguous network outcome occurs after server commit, the operation ID is lost and retry creates a duplicate transfer with a different idempotency key.
+**Root cause:** Operation ID is generated fresh on each confirm attempt and was not persisted before the API call in the original implementation. When an ambiguous network outcome occurs after server commit, the operation ID could be lost and retry would create a duplicate transfer with a different idempotency key.
 
 # User and Production Impact
 
@@ -24,7 +24,7 @@
 - Potential overdraft or insufficient funds on retry
 
 **Bank impact:**
-- Regulatory breach: duplicate execution violates payment accuracy requirements
+- Potential compliance/regulatory exposure: duplicate execution may violate payment accuracy requirements
 - Financial liability: must refund duplicate charges and compensate customers
 - Operational burden: manual reconciliation, customer support escalations
 - Reputational damage: loss of customer confidence in digital channels
@@ -68,12 +68,12 @@
 **Key decisions and safety rationale:**
 
 1. **Persist intent before remote call**
-   - Safe: SQLDelight transaction ensures atomicity; if remote call fails, intent remains for retry
+   - Safe: SQLDelight transaction provides atomicity; if remote call fails, intent remains for retry
    - Safe under timeout: operation ID survives client timeout and can be reused
    - Safe under cancellation: coroutine cancellation after persistence preserves operation for reconciliation
-   - Safe under process death: SQLDelight persists to disk; operation survives app restart
+   - Safe under process death: SQLDelight persists to disk; operation should survive app restart (not device-tested)
 
-2. **Preserve ambiguous outcomes instead of deleting**
+2. **Preserve ambiguous outcomes as OUTCOME_UNKNOWN**
    - Safe: distinguishes "outcome unknown" from "definitely failed"
    - Safe under repeated input: same operation ID prevents duplicate submission via idempotency
    - Safe under restoration: reconciliation can query backend status by operation ID
@@ -81,12 +81,13 @@
 3. **Reuse pending operation ID for retry**
    - Safe: idempotency contract guarantees same key + same payload returns existing transfer
    - Safe under repeated input: prevents duplicate execution even if user taps retry multiple times
-   - Safe under restoration: ViewModel checks for pending operation before generating new ID
+   - Implementation: ViewModel stores `pendingOperationId` in current instance; full process-death recovery not device-tested
 
-4. **Delete only on definitive rejection**
-   - Safe: 422 business rejection is terminal and cannot succeed on retry
+4. **Delete local record for specific failure categories**
+   - Deletes for: `NoInternetException`, `DefinitiveRejectionException`, `IdempotencyConflictException`, `AuthenticationException`
+   - Preserves as `OUTCOME_UNKNOWN` for: other exceptions including timeouts, connection loss, malformed responses
+   - Safe: terminal rejections (422) cannot succeed on retry; connectivity errors may be misclassified (residual risk)
    - Safe: preserves ambiguous outcomes for status reconciliation
-   - Safe: prevents retry loop on permanent failures
 
 # Shared vs Platform-specific Responsibility
 
@@ -104,16 +105,18 @@
 - Biometric authentication (Android: BiometricPrompt, iOS: LocalAuthentication)
 - Secure credential storage (Android: EncryptedSharedPreferences, iOS: Keychain)
 
-**Platform assumptions:**
-- SQLDelight transaction isolation is equivalent on both Android and iOS drivers
+**Platform assumptions (from code/documentation review):**
+- SQLDelight transaction isolation should be equivalent on both Android and iOS drivers
 - Lifecycle foreground events trigger reconciliation on both platforms
-- Database writes survive process termination on both platforms
+- Database writes should survive process termination on both platforms
 - No platform-specific production code changes were required for this invariant
 
 **Unverified platform behavior:**
+- SQLDelight transaction durability guarantees (WAL mode, synchronous writes) not experimentally verified
 - Exact timing of Android background process kill vs. SQLDelight flush
 - iOS background task completion guarantees for database writes
-- Force-quit behavior on physical devices (not tested in simulator/emulator)
+- Force-quit behavior on physical devices (not tested on device or simulator/emulator)
+- Full ViewModel state restoration across process death (pendingOperationId is in-memory only)
 
 # Alternatives
 
@@ -125,7 +128,7 @@
 **2. Durable persistence without stable ID reuse (rejected)**
 - Persist operation after API call but generate new ID on retry
 - **Why rejected:** Does not prevent duplicate execution; new operation ID bypasses idempotency contract
-- **Evidence:** docs/transfer-api.md:47 "Repeating the same identifier with a different canonical payload returns 409 Conflict"
+- **Evidence:** docs/transfer-api.md idempotency semantics require stable operation ID across retry attempts
 
 **3. Broad lifecycle/navigation/offline architecture refactor (rejected)**
 - Redesign ViewModel restoration, navigation effects, offline queue, background retry
@@ -144,9 +147,12 @@
 # Validation
 
 **Automated test evidence:**
-- Command: `./gradlew :shared:jvmTest --tests TransferRepositoryImplTest`
-- Result: PASSED
-- Coverage: Operation ID persistence before API call, operation ID reuse on retry, ambiguous outcome preservation, definitive rejection deletion
+- Command: `./gradlew :shared:jvmTest --tests TransferRepositoryImplTest --no-build-cache --no-configuration-cache`
+- Result: BUILD SUCCESSFUL
+- Coverage: 
+  1. Intent is persisted before the remote API call
+  2. Ambiguous outcome preserves the local operation as `OUTCOME_UNKNOWN`
+- **Not covered by focused tests:** ViewModel retry reuse, definitive rejection deletion, reconciliation flow, backend integration scenarios
 
 **Code review evidence:**
 - Inspected TransferRepositoryImpl.kt diff: saveIntent() called before remote.create()
@@ -165,19 +171,21 @@
 - Type safety preserved across repository/local/remote boundaries
 
 **Checks NOT performed:**
-- Android physical device force-quit → relaunch → reconciliation
-- iOS physical device background termination → relaunch → reconciliation
+- Android device or emulator testing (force-quit, background kill, low-memory scenarios)
+- iOS device or simulator testing (background termination, app suspension, memory pressure)
 - Scheduled payment occurrence submission with new persistence timing
-- Full integration test with backend stub ambiguous-outcome scenarios
+- Full integration test with backend stub ambiguous-outcome scenarios (COMMIT_THEN_TIMEOUT, etc.)
 - Performance impact of additional SQLDelight write before API call
+- SQLDelight transaction durability under process termination (reviewed in documentation only)
+- ViewModel state restoration across process death (pendingOperationId is in-memory)
 - Concurrent transfer submission from multiple app instances (not a supported scenario)
 
 # Residual Risks
 
-**1. Platform-specific process death behavior not fully verified**
+**1. Platform-specific process death behavior not verified**
 - **Condition:** Android/iOS background kill timing vs. SQLDelight flush completion
-- **Mitigation:** SQLDelight uses synchronous writes; transaction commit should be durable
-- **Remaining work:** Physical device testing with force-quit and low-memory scenarios
+- **Mitigation:** SQLDelight transaction semantics reviewed in documentation; durability expected but not device-tested
+- **Remaining work:** Physical device testing with force-quit, background kill, and low-memory scenarios on both platforms
 
 **2. Scheduled payment compatibility not regression-tested**
 - **Condition:** Scheduled payment occurrence submission shares TransferRepositoryImpl
@@ -199,7 +207,12 @@
 - **Mitigation:** API contract documents canonicalization; mobile/backend versions must be compatible
 - **Remaining work:** Coordinate any future payload changes with backend team
 
-**6. Cancellation semantics during persistence**
+**6. Connectivity error classification**
+- **Condition:** `NoInternetException` deletes local record; may misclassify some ambiguous network failures
+- **Mitigation:** Most ambiguous outcomes (timeout, connection loss, malformed response) preserved as `OUTCOME_UNKNOWN`
+- **Remaining work:** Review connectivity check accuracy; consider preserving `NoInternetException` as ambiguous if advisory check is unreliable
+
+**7. Cancellation semantics during persistence**
 - **Condition:** Coroutine cancellation between saveIntent() and remote.create()
 - **Mitigation:** Intent remains persisted; reconciliation can recover
 - **Remaining work:** Explicit cancellation test for this boundary
@@ -235,25 +248,18 @@
 **Mandatory pre-release conditions:**
 
 1. **Platform verification:**
-   - Test force-quit → relaunch → reconciliation on Android physical device
-   - Test background termination → relaunch → reconciliation on iOS physical device
-   - Verify SQLDelight transaction durability on both platforms under low-memory conditions
+   - Test force-quit → relaunch → reconciliation on Android physical device or emulator
+   - Test background termination → relaunch → reconciliation on iOS physical device or simulator
+   - Verify SQLDelight transaction durability under process termination on both platforms
 
 2. **Scheduled payment regression:**
    - Verify scheduled payment occurrence submission works with new persistence timing
    - Confirm occurrence ID generation and payload structure unchanged
-   - Test scheduled payment status reconciliation
 
 3. **Integration testing:**
-   - Run full backend stub scenarios: COMMIT_THEN_TIMEOUT, COMMIT_THEN_MALFORMED_RESPONSE, BLOCK_AFTER_COMMIT
+   - Run backend stub ambiguous-outcome scenarios: COMMIT_THEN_TIMEOUT, COMMIT_THEN_MALFORMED_RESPONSE, BLOCK_AFTER_COMMIT
    - Verify reconciliation finds and updates ambiguous operations
    - Confirm 409 Conflict handling when operation ID is reused with different payload
-
-4. **Telemetry:**
-   - Add metric for operation ID reuse vs. new generation
-   - Add metric for 409 Conflict frequency
-   - Add metric for reconciliation success rate
-   - Add alert for operations stuck in ambiguous state beyond threshold (e.g., 24 hours)
 
 **Compatible app/backend versions:**
 - Mobile change is compatible with existing backend idempotency contract
@@ -265,37 +271,20 @@
 - iOS: Background termination, app suspension, memory pressure
 - Both: Force quit, airplane mode toggle, network timeout scenarios
 
-**Post-release metrics:**
-- Operation ID collision rate (should be zero with ULID/UUID)
-- 409 Conflict frequency (should be rare; indicates payload canonicalization issue if frequent)
-- Duplicate transfer reports (should decrease significantly)
-- Reconciliation success rate (should be high for ambiguous outcomes)
-- Operations in ambiguous state beyond 24 hours (should be rare; indicates reconciliation gap)
-
 # Rollout and Rollback
 
-**Rollout strategy:**
-- Phased rollout: 5% → 25% → 50% → 100% over 2 weeks
-- Monitor duplicate transfer reports and 409 Conflict metrics at each phase
-- Pause rollout if duplicate rate does not decrease or conflict rate increases
-
-**Feature flag (optional):**
-- Not required for this change; behavior is always safer than previous version
-- If desired: flag to control whether ambiguous outcomes are preserved vs. deleted (default: preserve)
+**Rollout:**
+- Standard staged mobile release if applicable to deployment process
+- Monitor duplicate transfer reports after rollout
+- No backend changes required
 
 **Rollback:**
-- Revert production change via standard mobile release process
-- No backend changes required; rollback is client-only
-- Already-installed updated clients will continue to honor idempotency correctly
-- Rolled-back clients will revert to previous (riskier) behavior but remain compatible with backend
+- Revert via standard mobile release process
+- No backend coordination required; rollback is client-only
+- Already-installed updated clients continue to honor idempotency correctly
+- Rolled-back clients revert to previous (riskier) behavior but remain compatible with backend
 
-**Emergency mitigation:**
-- Backend can implement server-side duplicate detection by payload fingerprint as temporary safeguard
-- Backend can reject suspicious duplicate operation IDs (same source/destination/amount within short time window)
-- Customer support can manually reconcile duplicate transfers while rollback deploys
-
-**Mobile version compatibility:**
-- Updated mobile version is backward compatible with backend
-- Previous mobile version remains forward compatible with backend
-- No coordinated mobile/backend deployment required
-- Gradual user upgrade is safe
+**Mobile/backend compatibility:**
+- Mobile change is compatible with existing backend idempotency contract
+- No backend changes required
+- Existing and updated mobile clients can coexist (both honor idempotency-key semantics)

@@ -1,6 +1,6 @@
 # Tools and Purposes
 
-**Tool:** Aider with Claude 3.5 Sonnet
+**Tool:** Aider with Claude Sonnet
 
 **Bounded tasks:**
 1. Repository structure inspection and transfer flow analysis
@@ -22,55 +22,56 @@
 - Manually traced execution path: ViewModel generates ID → repository persists → remote call → response handling
 - Confirmed SQLDelight transaction semantics ensure atomicity of intent persistence
 
-**2. Reuse existing pending operation ID for retry instead of generating new ID**
+**2. Reuse pending operation ID for retry instead of generating new ID**
 
-**Suggestion:** Check TransferLocalDataSource for pending operation matching the draft before generating a new operation ID in TransferViewModel.confirm().
+**Suggestion:** Store the current pending operation ID in ViewModel state and reuse it when the user retries the same draft, instead of generating a fresh operation ID on every confirm.
 
 **Evidence used to validate:**
 - Reviewed TransferViewModel.kt:115 showing fresh ID generation on every confirm
-- Inspected TransferLocalDataSource.kt:82 unfinished() method for pending operation lookup
-- Confirmed draft equality logic can match pending operation to current user intent
-- Reviewed docs/transfer-api.md:46 confirming same key + same payload returns existing transfer (idempotency)
-- Traced retry flow: user taps retry → same draft → pending operation found → same ID reused → backend returns existing transfer
+- Confirmed that storing `pendingOperationId` in ViewModel prevents duplicate ID generation during retry within the same ViewModel instance
+- Reviewed docs/transfer-api.md idempotency semantics confirming same key + same payload returns existing transfer
+- Traced retry flow: user taps retry → same draft → pendingOperationId reused → backend returns existing transfer via idempotency
+- Note: Full process-death recovery not implemented; pendingOperationId is in-memory only
 
-**3. Preserve ambiguous-outcome operations instead of deleting them**
+**3. Preserve ambiguous-outcome operations as OUTCOME_UNKNOWN**
 
-**Suggestion:** Distinguish ambiguous network outcomes (timeout, connection loss) from definitive rejections (422) and preserve ambiguous operations for reconciliation instead of deleting them.
+**Suggestion:** Distinguish ambiguous network outcomes (timeout, connection loss, malformed response) from definitive failures and preserve ambiguous operations as `OUTCOME_UNKNOWN` for reconciliation instead of deleting them.
 
 **Evidence used to validate:**
-- Reviewed docs/transfer-api.md:95 "Cancellation, timeout, connection loss... can happen after server commit"
-- Reviewed docs/transfer-api.md:77-82 error response contract with `outcome` field
-- Inspected TransferRepositoryImpl.kt:38 showing delete on any exception
-- Confirmed reconciliation logic in TransferViewModel.kt:68 depends on local records existing
-- Verified that preserving ambiguous outcomes enables status query by operation ID
+- Reviewed docs/transfer-api.md "Cancellation, timeout, connection loss... can happen after server commit"
+- Reviewed docs/transfer-api.md error response contract with `outcome` field
+- Inspected TransferRepositoryImpl original implementation deleting on any exception
+- Confirmed reconciliation logic depends on local records existing
+- Verified that preserving ambiguous outcomes as `OUTCOME_UNKNOWN` enables status query by operation ID
+- Implementation deletes for specific categories (`NoInternetException`, `DefinitiveRejectionException`, `IdempotencyConflictException`, `AuthenticationException`) while preserving others
 
 # Rejected or Changed Suggestion
 
-**Rejected: Broader refactor including `sameEconomicPayload`, `recordAttempt`, and expanded error states**
+**Rejected: Broader refactor and test infrastructure suggestions**
 
-**What was suggested:** AI initially proposed a broader change including:
-- New `sameEconomicPayload()` method for draft comparison
-- `recordAttempt()` method to track submission attempts
+**What was suggested:** AI initially proposed broader changes including:
+- Additional helper methods for draft comparison and attempt tracking
 - Expanded error state with attempt counts and timestamps
-- Additional status fields and reconciliation logic
+- More comprehensive test infrastructure and mocking
+- Additional status fields and reconciliation logic beyond the core invariant
 
 **Why rejected:**
 - **Scope creep:** Exceeded the bounded vertical slice defined in PLAN.md
 - **Timebox constraint:** Broader refactor would consume remaining assessment time
 - **Risk:** More changes increase regression risk without proportional safety benefit
-- **Assessment focus:** ASSIGNMENT.md:13 "A focused, proven change is valued more highly than a broad refactor"
-- **Minimality:** Core invariant (stable operation ID before API call) can be achieved with smaller change
+- **Assessment focus:** ASSIGNMENT.md "A focused, proven change is valued more highly than a broad refactor"
+- **Minimality:** Core invariant (stable operation ID before API call) can be achieved with smaller, focused change
 
 **What was kept:**
-- Focused on the three essential changes: saveIntent before remote call, preserve ambiguous outcomes, reuse pending operation ID
+- Three essential changes: saveIntent before remote call, preserve ambiguous outcomes as OUTCOME_UNKNOWN, reuse pending operation ID in ViewModel
 - Minimal additions to existing methods rather than new abstractions
-- Preserved existing error handling and status mapping where sufficient
+- Focused unit tests for the two core behaviors: intent persistence before API call, ambiguous outcome preservation
 
 **Evidence for rejection:**
 - Manually reviewed Git history showing broader changes in earlier commits
 - Reset to focused implementation addressing only the duplicate-execution risk
 - Confirmed smaller change still establishes the required invariant
-- Verified test coverage remains meaningful with focused scope
+- Verified focused test coverage is meaningful for the core behaviors
 
 # Independent Verification
 
@@ -99,26 +100,29 @@
 
 **Platform-specific assumption verification:**
 
-**Assumption:** SQLDelight transaction isolation and durability are equivalent on Android (AndroidSqliteDriver) and iOS (NativeSqliteDriver).
+**Assumption:** SQLDelight transaction isolation and durability should be equivalent on Android (AndroidSqliteDriver) and iOS (NativeSqliteDriver), and database writes should survive process termination.
 
 **Verification approach:**
 - Reviewed SQLDelight documentation for transaction semantics
-- Inspected shared/src/androidMain and shared/src/iosMain for driver implementations
-- Confirmed both platforms use synchronous write-ahead logging (WAL) mode
-- Reviewed docs/current-architecture.md:82 stating SQLDelight is the shared source of truth
+- Inspected shared/src/androidMain and shared/src/iosMain for driver implementations at repository source level
+- Reviewed docs/current-architecture.md stating SQLDelight is the shared source of truth
+- Confirmed both platforms use SQLDelight with platform-specific drivers
 
 **Unverified platform behavior:**
+- SQLDelight transaction durability guarantees (WAL mode, synchronous writes, flush timing) not experimentally verified
 - Exact timing of process termination vs. SQLDelight flush on physical devices
-- Force-quit behavior on Android/iOS physical devices (not tested in emulator/simulator)
+- Force-quit behavior on Android/iOS physical devices (not tested on device, emulator, or simulator)
 - Background task completion guarantees for database writes on iOS
 - Low-memory process kill timing on Android
+- Full ViewModel state restoration across process death (pendingOperationId is in-memory only)
 
 **Checks NOT performed:**
-- Android emulator or physical device testing
-- iOS simulator or physical device testing
-- Backend stub integration testing with ambiguous-outcome scenarios
-- Scheduled payment regression testing
-- Performance profiling of additional SQLDelight write
+- Android emulator or physical device testing (force-quit, background kill, lifecycle scenarios)
+- iOS simulator or physical device testing (background termination, app suspension, memory pressure)
+- Backend stub integration testing with ambiguous-outcome scenarios (COMMIT_THEN_TIMEOUT, etc.)
+- Scheduled payment regression testing with new persistence timing
+- Performance profiling of additional SQLDelight write before API call
+- SQLDelight transaction durability under process termination (reviewed in documentation only)
 
 # Data Boundary
 
