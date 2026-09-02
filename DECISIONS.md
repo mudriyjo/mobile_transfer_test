@@ -38,7 +38,7 @@
 
 **Vertical slice implemented:** Stable operation identity with durable intent persistence.
 
-**Invariant:** The operation ID for a transfer intent must be durably persisted before the first API call, survive process death, and be reused for any retry or recovery of the same customer intent.
+**Invariant:** The operation ID for a transfer intent must be durably persisted before the first API call and reused for any retry of the same customer intent. The durable record is intended to support recovery after process death; automatic ViewModel restoration of `pendingOperationId` is outside this change.
 
 **Specific changes:**
 1. Persist transfer intent (operation ID + payload) to SQLDelight BEFORE calling remote API
@@ -68,10 +68,10 @@
 **Key decisions and safety rationale:**
 
 1. **Persist intent before remote call**
-   - Safe: SQLDelight transaction provides atomicity; if remote call fails, intent remains for retry
-   - Safe under timeout: operation ID survives client timeout and can be reused
-   - Safe under cancellation: coroutine cancellation after persistence preserves operation for reconciliation
-   - Safe under process death: SQLDelight persists to disk; operation should survive app restart (not device-tested)
+   - Safe: the SQLDelight write is performed before the remote call, so the operation identity is available locally before submission
+   - Safe under timeout: the persisted operation ID can be reused after an ambiguous client timeout
+   - Safe under cancellation: if cancellation occurs after persistence, the intent remains available for reconciliation
+   - Process-death behavior: the durable record is intended to survive app restart, but physical process-termination durability was not device-tested
 
 2. **Preserve ambiguous outcomes as OUTCOME_UNKNOWN**
    - Safe: distinguishes "outcome unknown" from "definitely failed"
@@ -163,11 +163,11 @@
 **API/documentation review:**
 - docs/transfer-api.md: idempotency semantics, outcome certainty, 409 Conflict behavior
 - docs/current-architecture.md: SQLDelight as source of truth, repository coordination
-- Confirmed backend stub implements deterministic ambiguous-outcome scenarios
+- Reviewed backend stub implementation for deterministic ambiguous-outcome scenarios
 
-**Static analysis:**
-- Kotlin compilation successful
-- No new compiler warnings introduced
+**Build/test verification:**
+- Focused JVM test compilation succeeded
+- Existing Gradle deprecation warnings remain
 - Type safety preserved across repository/local/remote boundaries
 
 **Checks NOT performed:**
@@ -237,7 +237,7 @@
 **Decision:** `CONDITIONAL GO`
 
 **What is safe:**
-- Operation ID persistence before API call prevents duplicate execution after ambiguous outcome
+- With the documented backend idempotency contract, operation ID persistence before the API call and reuse across retry prevents duplicate execution for an ambiguous outcome
 - Operation ID reuse across retry honors idempotency contract
 - Ambiguous outcomes preserved for reconciliation instead of deleted
 - Shared-layer change benefits both Android and iOS equally
